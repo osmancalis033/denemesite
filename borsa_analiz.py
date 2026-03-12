@@ -345,10 +345,7 @@ def _tefas_crawler_available():
 
 @st.cache_data(ttl=1800)
 def tefas_fetch_history(code: str, days: int = 90) -> pd.DataFrame:
-    """
-    tefas-crawler ile NAV geçmişi çek.
-    Dönen DataFrame sütunları: date, price, market_cap, number_of_shares, ...
-    """
+    """tefas-crawler ile NAV geçmişi + portföy dağılımı sütunlarıyla çek."""
     from tefas import Crawler
     end   = datetime.today()
     start = end - timedelta(days=days)
@@ -362,13 +359,10 @@ def tefas_fetch_history(code: str, days: int = 90) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def tefas_fetch_single_day(code: str) -> dict:
-    """
-    Bugünkü / en son gün verisi (dict olarak).
-    Fon adı, portföy büyüklüğü, pay sayısı, fiyat için.
-    """
+    """En son gün verisi (dict)."""
     from tefas import Crawler
     end   = datetime.today()
-    start = end - timedelta(days=5)   # hafta sonu güvencesi
+    start = end - timedelta(days=7)
     tefas = Crawler()
     df = tefas.fetch(
         start=start.strftime("%Y-%m-%d"),
@@ -378,6 +372,31 @@ def tefas_fetch_single_day(code: str) -> dict:
     if df is not None and not df.empty:
         return df.sort_values("date").iloc[-1].to_dict()
     return {}
+
+@st.cache_data(ttl=3600)
+def get_comparison_data(days: int = 90) -> dict:
+    """Altın, Dolar, BIST100 ve mevduat faizi geçmiş verisi."""
+    end   = datetime.today()
+    start = end - timedelta(days=days + 10)
+    result = {}
+    benchmarks = {
+        "BIST-100":  "XU100.IS",
+        "Dolar/TL":  "USDTRY=X",
+        "Altın/TL":  "GC=F",        # Ons altın — XAUUSD * USDTRY ile çevrilir
+        "Gram Altın":"GLDTR.IS",    # Türkiye Altın ETF
+    }
+    for label, ticker in benchmarks.items():
+        try:
+            h = yf.Ticker(ticker).history(
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+            )
+            if not h.empty:
+                result[label] = h["Close"]
+        except Exception:
+            pass
+    return result
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1129,7 +1148,6 @@ def main():
     # ══════════════════════════════════════════════════════════════════════════
     with main_tab3:
 
-        # tefas-crawler kurulu mu kontrol et
         if not _tefas_crawler_available():
             st.error("**tefas-crawler** kütüphanesi bulunamadı.")
             st.code("pip install tefas-crawler", language="bash")
@@ -1137,7 +1155,7 @@ def main():
 
         st.markdown("""
         <div class="info-box">
-            💼 TEFAS fon kodu girerek NAV geçmişi, performans ve portföy dağılımı alın.<br>
+            💼 TEFAS fon kodu girerek NAV geçmişi, getiri tablosu, kıyaslama ve portföy dağılımı alın.<br>
             <span style="font-size:11px">Örnek kodlar: AFK · MAC · TI2 · GAF · YAF · IPB · NNF · KYD · GLD · AGF · GMF · TTE · AAK</span>
         </div>""", unsafe_allow_html=True)
 
@@ -1171,213 +1189,382 @@ def main():
 
             with st.spinner(f"**{fc}** TEFAS'tan yükleniyor…"):
                 try:
-                    df_hist = tefas_fetch_history(fc, days)
+                    df_hist  = tefas_fetch_history(fc, days)
                     latest_d = tefas_fetch_single_day(fc)
                 except Exception as e:
-                    st.error(f"Veri çekme hatası: {e}")
-                    st.stop()
+                    st.error(f"Veri çekme hatası: {e}"); st.stop()
 
             if df_hist.empty:
-                st.error(f"**{fc}** fon kodu bulunamadı ya da veri dönmedi. "
-                         "Kodu kontrol edin (büyük harf, 3 karakter).")
+                st.error(f"**{fc}** fon kodu bulunamadı ya da veri dönmedi.")
                 st.stop()
 
-            # ── sütun adlarını normalize et (tefas-crawler v0.x / v1.x farkı) ──
-            # Olası sütun adları: date/TARIH, price/BIRIMPAYDEGERI, ...
-            col_map = {}
-            for c in df_hist.columns:
-                cl = c.lower()
-                if cl in ("date","tarih"):                     col_map[c] = "tarih"
-                elif cl in ("price","birimpaydegeri","fiyat"): col_map[c] = "fiyat"
-                elif cl in ("market_cap","portfoybuyukluk","portföy_büyüklüğü"): col_map[c] = "portfoy"
-                elif cl in ("number_of_shares","tedpaysayisi"): col_map[c] = "pay_sayisi"
-                elif cl in ("number_of_investors","yatirimcisayisi"): col_map[c] = "yatirimci"
-                elif cl in ("title","fonunvan","fon_adi"):     col_map[c] = "fon_adi"
-                elif cl in ("fund_type","fonturkod","tur"):    col_map[c] = "fon_turu"
-            df_hist = df_hist.rename(columns=col_map)
+            # ── Sütun normalize ───────────────────────────────────────────
+            # tefas-crawler v0.5 sütunları:
+            # date, price, code, title, market_cap, number_of_shares,
+            # number_of_investors, stock, government_bond, eurobonds,
+            # precious_metals, repo, reverse_repo, fx_payable_bills,
+            # term_deposit, foreign_equity, etc.
+            df = df_hist.copy()
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            if "price" in df.columns:
+                df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            if "market_cap" in df.columns:
+                df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+            if "number_of_shares" in df.columns:
+                df["number_of_shares"] = pd.to_numeric(df["number_of_shares"], errors="coerce")
+            if "number_of_investors" in df.columns:
+                df["number_of_investors"] = pd.to_numeric(df["number_of_investors"], errors="coerce")
+            df = df.sort_values("date") if "date" in df.columns else df
 
-            # Tarih ve fiyat sütunlarını sayısala çevir
-            if "tarih" in df_hist.columns:
-                df_hist["tarih"] = pd.to_datetime(df_hist["tarih"], errors="coerce")
-            if "fiyat" in df_hist.columns:
-                df_hist["fiyat"] = pd.to_numeric(df_hist["fiyat"], errors="coerce")
+            # ── Metrikler ─────────────────────────────────────────────────
+            def _lv(col, default=0):
+                if col in df.columns:
+                    s = pd.to_numeric(df[col], errors="coerce").dropna()
+                    return float(s.iloc[-1]) if not s.empty else default
+                return float(latest_d.get(col, default) or default)
 
-            df_hist = df_hist.sort_values("tarih") if "tarih" in df_hist.columns else df_hist
-
-            # ── En son satırdan metrikler ─────────────────────────────────
-            def _lv(key, default=0):
-                if key in df_hist.columns:
-                    v = pd.to_numeric(df_hist[key], errors="coerce").dropna()
-                    return float(v.iloc[-1]) if not v.empty else default
-                if key in latest_d:
-                    try: return float(latest_d[key])
-                    except Exception: return default
-                return default
-
-            nav_cur   = _lv("fiyat")
-            nav_old   = float(df_hist["fiyat"].dropna().iloc[0]) if "fiyat" in df_hist.columns else nav_cur
+            nav_cur   = _lv("price")
+            nav_old   = float(df["price"].dropna().iloc[0]) if "price" in df.columns and len(df["price"].dropna()) > 0 else nav_cur
             nav_chg   = ((nav_cur - nav_old) / nav_old * 100) if nav_old else 0
             nav_clr   = "#48bb78" if nav_chg >= 0 else "#fc8181"
             nav_arr   = "▲" if nav_chg >= 0 else "▼"
-            port_size = _lv("portfoy")
-            pay_s     = _lv("pay_sayisi")
-            yat_s     = _lv("yatirimci")
+            mkt_cap   = _lv("market_cap")
+            n_shares  = _lv("number_of_shares")
+            n_inv     = _lv("number_of_investors")
 
-            # Fon adı / türü
-            fon_adi = "—"
-            for k in ("fon_adi","title","fonunvan"):
-                if k in df_hist.columns and not df_hist[k].dropna().empty:
-                    fon_adi = str(df_hist[k].dropna().iloc[-1]); break
-                if k in latest_d and latest_d[k]:
-                    fon_adi = str(latest_d[k]); break
-            fon_turu = "—"
-            for k in ("fon_turu","fund_type","fonturkod"):
-                if k in df_hist.columns and not df_hist[k].dropna().empty:
-                    fon_turu = str(df_hist[k].dropna().iloc[-1]); break
-                if k in latest_d and latest_d[k]:
-                    fon_turu = str(latest_d[k]); break
+            fon_adi = str(df["title"].dropna().iloc[-1]) if "title" in df.columns and not df["title"].dropna().empty else latest_d.get("title","—") or "—"
+            fon_turu = str(df["fund_type"].dropna().iloc[-1]) if "fund_type" in df.columns and not df["fund_type"].dropna().empty else latest_d.get("fund_type","—") or "—"
 
-            # ── Başlık kartı ──────────────────────────────────────────────
+            # ── Başlık ────────────────────────────────────────────────────
             st.markdown(f"""
             <div class="stock-header">
-              <div style="display:flex;justify-content:space-between;
-                          align-items:flex-start;flex-wrap:wrap;gap:12px">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
                 <div>
                   <div style="font-size:22px;font-weight:700;color:#e2e8f0">{fon_adi}</div>
-                  <div style="font-size:13px;color:#4299e1;font-weight:600;margin-top:3px">
-                    ● {fc} · TEFAS</div>
-                  <div style="font-size:12px;color:#718096;margin-top:3px">
-                    Fon Türü: {fon_turu}</div>
+                  <div style="font-size:13px;color:#4299e1;font-weight:600;margin-top:3px">● {fc} · TEFAS</div>
+                  <div style="font-size:12px;color:#718096;margin-top:3px">Fon Türü: {fon_turu}</div>
                 </div>
                 <div style="text-align:right">
-                  <div style="font-size:28px;font-weight:700;color:{nav_clr}">
-                    {nav_cur:,.4f} ₺</div>
-                  <div style="font-size:14px;font-weight:600;color:{nav_clr}">
-                    {nav_arr} {abs(nav_chg):.2f}% ({days} gün)</div>
+                  <div style="font-size:28px;font-weight:700;color:{nav_clr}">{nav_cur:,.4f} ₺</div>
+                  <div style="font-size:14px;font-weight:600;color:{nav_clr}">{nav_arr} {abs(nav_chg):.2f}% ({days} gün)</div>
                 </div>
               </div>
             </div>""", unsafe_allow_html=True)
 
-            # Metrik kartlar
+            # ── 4 metrik kart ─────────────────────────────────────────────
             mc1, mc2, mc3, mc4 = st.columns(4)
-            for col_, lbl_, val_ in [
-                (mc1, "Portföy Büyüklüğü", fmt_num(port_size, suffix=" ₺")),
-                (mc2, "Tedavül Pay Sayısı", fmt_num(pay_s, 0)),
-                (mc3, "Yatırımcı Sayısı",   fmt_num(yat_s, 0) if yat_s else "—"),
-                (mc4, f"{days} Gün Getiri",
-                 f"%{nav_chg:+.2f}" if nav_chg >= 0 else f"%{nav_chg:.2f}"),
+            ret_cls = "positive" if nav_chg >= 0 else "negative"
+            for col_, lbl_, val_, cls_ in [
+                (mc1, "Fon Toplam Değeri",  fmt_num(mkt_cap, suffix=" ₺"),  ""),
+                (mc2, "Tedavül Pay Sayısı", fmt_num(n_shares, 0),           ""),
+                (mc3, "Yatırımcı Sayısı",   fmt_num(n_inv, 0) if n_inv else "—", ""),
+                (mc4, f"{days} Gün Getiri", f"%{nav_chg:+.2f}",            ret_cls),
             ]:
                 with col_:
-                    cls_ = ("positive" if nav_chg >= 0 else "negative") if lbl_.endswith("Getiri") else ""
                     st.markdown(mcard(lbl_, val_, cls_), unsafe_allow_html=True)
 
             st.markdown("<div style='margin:10px 0'></div>", unsafe_allow_html=True)
 
-            # ── Alt sekmeler ──────────────────────────────────────────────
-            ft1, ft2 = st.tabs(["📈 NAV Grafiği & Performans", "🥧 Portföy Dağılımı"])
+            # ── 3 alt sekme ───────────────────────────────────────────────
+            ft1, ft2, ft3 = st.tabs(["📈 NAV & Dönemsel Getiri", "📊 Kıyaslama", "🥧 Varlık Dağılımı"])
 
+            # ─────────────────────────────────────────────────────────────
+            # SEKME 1: NAV + Dönemsel Getiri
+            # ─────────────────────────────────────────────────────────────
             with ft1:
-                if "tarih" in df_hist.columns and "fiyat" in df_hist.columns:
-                    df_plot = df_hist[["tarih","fiyat"]].dropna()
+                if "date" in df.columns and "price" in df.columns:
+                    df_plot = df[["date","price"]].dropna()
                     if len(df_plot) > 1:
                         fig_nav = go.Figure()
                         fig_nav.add_trace(go.Scatter(
-                            x=df_plot["tarih"], y=df_plot["fiyat"],
+                            x=df_plot["date"], y=df_plot["price"],
                             mode="lines", name="Birim Pay Değeri",
                             line=dict(color="#4299e1", width=2.5),
-                            fill="tozeroy",
-                            fillcolor="rgba(66,153,225,0.08)",
+                            fill="tozeroy", fillcolor="rgba(66,153,225,0.08)",
                         ))
                         fig_nav.update_layout(
-                            height=340, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                            height=320, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
                             xaxis=dict(gridcolor="#1a1f2e"),
                             yaxis=dict(gridcolor="#1a1f2e", ticksuffix=" ₺"),
                             font=dict(color="#8892a4", size=11),
-                            margin=dict(l=0,r=0,t=10,b=0),
-                            hovermode="x unified",
+                            margin=dict(l=0,r=0,t=10,b=0), hovermode="x unified",
                         )
                         st.plotly_chart(fig_nav, use_container_width=True)
 
-                # Dönemsel performans tablosu
-                st.markdown("<div class='section-title'>📋 Dönemsel Performans</div>",
-                            unsafe_allow_html=True)
-                if "fiyat" in df_hist.columns:
-                    prices = df_hist["fiyat"].dropna()
+                # Dönemsel getiri tablosu (günlük, haftalık, aylık, yıllık)
+                st.markdown("<div class='section-title'>📋 Dönemsel Getiri Analizi</div>", unsafe_allow_html=True)
+                if "price" in df.columns:
+                    prices = df["price"].dropna().reset_index(drop=True)
                     cur_p  = float(prices.iloc[-1])
                     n      = len(prices)
+
                     perf_rows = []
-                    for lbl_, d_ in [("Son 7 Gün",7),("Son 30 Gün",30),
-                                     ("Son 60 Gün",60),("Son 90 Gün",90),
-                                     ("Tüm Dönem", n-1)]:
+                    periods = [
+                        ("Günlük",    1),
+                        ("Haftalık",  5),
+                        ("Aylık",    21),
+                        ("3 Aylık",  63),
+                        ("6 Aylık", 126),
+                        ("Yıllık",  252),
+                        ("Tüm Dönem", n-1),
+                    ]
+                    for lbl_, d_ in periods:
                         if d_ < n:
-                            old_p = float(prices.iloc[-d_-1])
+                            old_p = float(prices.iloc[max(0, n-d_-1)])
                             ret   = (cur_p - old_p) / old_p * 100 if old_p else 0
-                            clr   = "🟢" if ret >= 0 else "🔴"
+                            icon  = "🟢" if ret >= 0 else "🔴"
                             perf_rows.append({
-                                "Dönem": lbl_,
+                                "Dönem":            lbl_,
                                 "Başlangıç Fiyatı": f"{old_p:,.4f} ₺",
                                 "Güncel Fiyat":     f"{cur_p:,.4f} ₺",
-                                "Getiri":           f"{clr} {ret:+.2f}%",
+                                "Getiri":           f"{icon} {ret:+.2f}%",
                             })
                     if perf_rows:
-                        st.dataframe(pd.DataFrame(perf_rows),
-                                     use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(perf_rows), use_container_width=True, hide_index=True)
 
-                # Ham veri önizleme
-                with st.expander("📄 Ham Veri (Son 10 Kayıt)"):
-                    disp_cols = [c for c in ["tarih","fiyat","portfoy","pay_sayisi","yatirimci"]
-                                 if c in df_hist.columns]
-                    st.dataframe(df_hist[disp_cols].tail(10), use_container_width=True, hide_index=True)
+                # Fon toplam değeri zaman serisi
+                if "market_cap" in df.columns and df["market_cap"].dropna().shape[0] > 1:
+                    st.markdown("<div class='section-title'>💰 Fon Toplam Değeri (AUM) Geçmişi</div>", unsafe_allow_html=True)
+                    df_aum = df[["date","market_cap"]].dropna()
+                    fig_aum = go.Figure(go.Scatter(
+                        x=df_aum["date"], y=df_aum["market_cap"],
+                        mode="lines", fill="tozeroy",
+                        line=dict(color="#48bb78", width=2),
+                        fillcolor="rgba(72,187,120,0.07)",
+                        name="AUM",
+                    ))
+                    fig_aum.update_layout(
+                        height=220, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                        xaxis=dict(gridcolor="#1a1f2e"),
+                        yaxis=dict(gridcolor="#1a1f2e",
+                                   tickformat=".2s", ticksuffix=" ₺"),
+                        font=dict(color="#8892a4", size=11),
+                        margin=dict(l=0,r=0,t=10,b=0), hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_aum, use_container_width=True)
 
+                # Yatırımcı sayısı zaman serisi
+                if "number_of_investors" in df.columns and df["number_of_investors"].dropna().shape[0] > 1:
+                    st.markdown("<div class='section-title'>👥 Yatırımcı Sayısı Geçmişi</div>", unsafe_allow_html=True)
+                    df_inv2 = df[["date","number_of_investors"]].dropna()
+                    fig_inv = go.Figure(go.Scatter(
+                        x=df_inv2["date"], y=df_inv2["number_of_investors"],
+                        mode="lines", fill="tozeroy",
+                        line=dict(color="#9f7aea", width=2),
+                        fillcolor="rgba(159,122,234,0.07)",
+                        name="Yatırımcı",
+                    ))
+                    fig_inv.update_layout(
+                        height=200, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                        xaxis=dict(gridcolor="#1a1f2e"),
+                        yaxis=dict(gridcolor="#1a1f2e", tickformat=".2s"),
+                        font=dict(color="#8892a4", size=11),
+                        margin=dict(l=0,r=0,t=10,b=0), hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_inv, use_container_width=True)
+
+            # ─────────────────────────────────────────────────────────────
+            # SEKME 2: Kıyaslama (Altın, Dolar, BIST100)
+            # ─────────────────────────────────────────────────────────────
             with ft2:
-                # tefas-crawler allocation sütunları varsa göster
-                alloc_cols_possible = [c for c in df_hist.columns
-                    if any(k in c.lower() for k in
-                           ("stock","bond","eurobond","gold","repo","other",
-                            "hisse","tahvil","altin","doviz","repo","diger",
-                            "equity","fixed","money","fund"))]
+                st.markdown("<div class='section-title'>📊 Kıyaslama: Fon vs Piyasa Göstergeleri</div>", unsafe_allow_html=True)
+                st.markdown("""<div class="info-box" style="font-size:11px">
+                    Tüm seriler başlangıç tarihine göre normalize edilmiştir (100 = başlangıç değeri).
+                    Böylece yüzde bazlı karşılaştırma yapılabilir.</div>""", unsafe_allow_html=True)
 
-                if alloc_cols_possible:
-                    last_row = df_hist.iloc[-1]
-                    alloc_data = {}
-                    for c in alloc_cols_possible:
+                with st.spinner("Karşılaştırma verileri yükleniyor…"):
+                    bench_data = get_comparison_data(days)
+
+                if "date" in df.columns and "price" in df.columns:
+                    df_cmp = df[["date","price"]].dropna().set_index("date")
+                    df_cmp.index = pd.to_datetime(df_cmp.index)
+
+                    # Normalize et (ilk değer = 100)
+                    fig_cmp = go.Figure()
+
+                    fund_norm = df_cmp["price"] / df_cmp["price"].iloc[0] * 100
+                    fig_cmp.add_trace(go.Scatter(
+                        x=fund_norm.index, y=fund_norm.values,
+                        mode="lines", name=f"Fon ({fc})",
+                        line=dict(color="#4299e1", width=2.5),
+                    ))
+
+                    bench_colors = {"BIST-100":"#48bb78","Dolar/TL":"#f6e05e",
+                                    "Altın/TL":"#fbd38d","Gram Altın":"#ed8936"}
+                    for label, series in bench_data.items():
                         try:
-                            v = float(last_row[c])
-                            if v > 0:
-                                alloc_data[c] = v
+                            s = series.copy()
+                            s.index = pd.to_datetime(s.index).tz_localize(None)
+                            # Fon tarih aralığıyla hizala
+                            s = s[s.index >= df_cmp.index.min()]
+                            if len(s) < 2: continue
+                            s_norm = s / s.iloc[0] * 100
+                            fig_cmp.add_trace(go.Scatter(
+                                x=s_norm.index, y=s_norm.values,
+                                mode="lines", name=label,
+                                line=dict(color=bench_colors.get(label,"#a0aec0"),
+                                          width=1.8, dash="dot"),
+                            ))
                         except Exception:
                             pass
 
-                    if alloc_data:
-                        labels = list(alloc_data.keys())
-                        values = list(alloc_data.values())
+                    fig_cmp.add_hline(y=100, line_color="rgba(100,100,100,0.4)",
+                                      line_dash="dot", line_width=1)
+                    fig_cmp.update_layout(
+                        height=380, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                        xaxis=dict(gridcolor="#1a1f2e"),
+                        yaxis=dict(gridcolor="#1a1f2e", ticksuffix=""),
+                        font=dict(color="#8892a4", size=11),
+                        legend=dict(bgcolor="rgba(26,31,46,0.9)", bordercolor="#2d3748",
+                                    borderwidth=1, font=dict(size=11)),
+                        margin=dict(l=0,r=0,t=10,b=0), hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_cmp, use_container_width=True)
 
-                        col_pie, col_tbl = st.columns([1, 1])
-                        with col_pie:
-                            fig_fp = go.Figure(go.Pie(
-                                labels=labels, values=values,
-                                hole=0.45, textfont=dict(size=11),
-                            ))
-                            fig_fp.update_layout(
-                                height=340, margin=dict(l=0,r=0,t=6,b=0),
-                                paper_bgcolor="#0e1117",
-                                font=dict(color="#8892a4", size=10),
-                                legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0)"),
-                            )
-                            st.plotly_chart(fig_fp, use_container_width=True)
-
-                        with col_tbl:
-                            df_alloc = pd.DataFrame({
-                                "Varlık": labels,
-                                "Oran (%)": [f"{v:.3f}%" for v in values],
+                    # Getiri karşılaştırma tablosu
+                    cmp_rows = [{"Gösterge": f"🟦 Fon ({fc})",
+                                 "Getiri (%)": f"{nav_chg:+.2f}%",
+                                 "Son Değer": f"{nav_cur:,.4f} ₺"}]
+                    for label, series in bench_data.items():
+                        try:
+                            s = series.copy()
+                            s.index = pd.to_datetime(s.index).tz_localize(None)
+                            s = s[s.index >= df_cmp.index.min()].dropna()
+                            if len(s) < 2: continue
+                            ret_b = (float(s.iloc[-1]) - float(s.iloc[0])) / float(s.iloc[0]) * 100
+                            icon  = "🟢" if ret_b >= 0 else "🔴"
+                            cmp_rows.append({
+                                "Gösterge": label,
+                                "Getiri (%)": f"{icon} {ret_b:+.2f}%",
+                                "Son Değer": f"{float(s.iloc[-1]):,.2f}",
                             })
-                            st.dataframe(df_alloc, use_container_width=True,
-                                         hide_index=True, height=340)
-                    else:
-                        st.info("Portföy dağılım verisi bu fon için bulunamadı.")
+                        except Exception:
+                            pass
+                    st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
                 else:
-                    st.info("Portföy dağılım verisi bu fon için mevcut değil. "
-                            "tefas-crawler bazı fon türleri için dağılım döndürmeyebilir.")
+                    st.info("Kıyaslama için fon fiyat verisi gerekiyor.")
+
+            # ─────────────────────────────────────────────────────────────
+            # SEKME 3: Varlık Dağılımı
+            # ─────────────────────────────────────────────────────────────
+            with ft3:
+                # tefas-crawler'ın portföy sütunları (v0.5 şeması)
+                # Hepsi 0-100 arası yüzde değeri
+                ALLOC_COLS = {
+                    "stock":                          "Hisse Senedi",
+                    "government_bond":                "Devlet Tahvili",
+                    "eurobonds":                      "Eurobond",
+                    "precious_metals":                "Kıymetli Madenler",
+                    "repo":                           "Repo",
+                    "reverse_repo":                   "Ters Repo",
+                    "term_deposit":                   "Vadeli Mevduat",
+                    "fx_payable_bills":               "Döviz Ödemeli Bono",
+                    "foreign_currency_bills":         "Dövizli Tahvil",
+                    "bank_bills":                     "Banka Bonosu",
+                    "exchange_traded_fund":           "Borsa Yatırım Fonu",
+                    "fund_participation_certificate": "Fon Katılma Belgesi",
+                    "commercial_paper":               "Finansman Bonosu",
+                    "government_bonds_and_bills_fx":  "Kamu Dış Borç",
+                    "participation_account":          "Katılım Hesabı",
+                    "government_lease_certificates":  "Kamu Kira Sertif.",
+                    "private_sector_lease_certificates": "Özel Sektör Kira",
+                    "private_sector_bond":            "Özel Sektör Tahvil",
+                    "derivatives":                    "Türev Araçlar",
+                    "asset_backed_securities":        "Varlığa Dayalı Menkul",
+                    "foreign_equity":                 "Yabancı Hisse",
+                    "foreign_debt_instruments":       "Yabancı Borç Aracı",
+                    "other":                          "Diğer",
+                }
+
+                # Mevcut sütunları filtrele
+                avail = {v: df[k].dropna().iloc[-1]
+                         for k, v in ALLOC_COLS.items()
+                         if k in df.columns and not df[k].dropna().empty}
+                avail = {k: float(v) for k, v in avail.items() if float(v) > 0.001}
+
+                if avail:
+                    labels  = list(avail.keys())
+                    values  = list(avail.values())
+                    total_w = sum(values)
+
+                    col_pie, col_tbl = st.columns([1, 1])
+                    with col_pie:
+                        fig_fp = go.Figure(go.Pie(
+                            labels=labels, values=values,
+                            hole=0.45, textfont=dict(size=11),
+                            textinfo="percent+label",
+                        ))
+                        fig_fp.update_layout(
+                            height=380, margin=dict(l=0,r=0,t=16,b=0),
+                            paper_bgcolor="#0e1117",
+                            font=dict(color="#8892a4", size=10),
+                            legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0)"),
+                            title=dict(text=f"Toplam: %{total_w:.1f}",
+                                       font=dict(color="#8892a4", size=11),
+                                       x=0.5),
+                        )
+                        st.plotly_chart(fig_fp, use_container_width=True)
+
+                    with col_tbl:
+                        # Zaman serisi bar: hangi varlık ne kadar ağırlıkta?
+                        # Son değerleri bar olarak göster
+                        df_bar_alloc = pd.DataFrame({
+                            "Varlık Sınıfı": labels,
+                            "Oran (%)": values,
+                        }).sort_values("Oran (%)", ascending=True)
+
+                        fig_hall = go.Figure(go.Bar(
+                            y=df_bar_alloc["Varlık Sınıfı"],
+                            x=df_bar_alloc["Oran (%)"],
+                            orientation="h",
+                            marker=dict(
+                                color=df_bar_alloc["Oran (%)"],
+                                colorscale="Viridis", showscale=False,
+                            ),
+                            text=df_bar_alloc["Oran (%)"].apply(lambda x: f"%{x:.2f}"),
+                            textposition="outside",
+                        ))
+                        fig_hall.update_layout(
+                            height=max(250, len(df_bar_alloc)*34),
+                            paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                            xaxis=dict(gridcolor="#1a1f2e", ticksuffix="%"),
+                            yaxis=dict(gridcolor="#1a1f2e", tickfont=dict(size=10)),
+                            font=dict(color="#8892a4", size=11),
+                            margin=dict(l=0, r=60, t=10, b=0),
+                        )
+                        st.plotly_chart(fig_hall, use_container_width=True)
+
+                    # Varlık dağılımı zaman serisi (sadece büyük ağırlıklar)
+                    top_alloc = sorted(avail.items(), key=lambda x: x[1], reverse=True)[:5]
+                    top_keys_raw = [k for k, _ in [(k2,v2) for k2, v2 in ALLOC_COLS.items()
+                                                    if ALLOC_COLS.get(k2) in [t[0] for t in top_alloc]]
+                                    if k in df.columns]
+                    if len(top_keys_raw) > 1 and "date" in df.columns:
+                        st.markdown("<div class='section-title'>📈 Varlık Dağılımı Değişimi</div>", unsafe_allow_html=True)
+                        fig_ts = go.Figure()
+                        COLORS = ["#4299e1","#48bb78","#f6e05e","#fc8181","#9f7aea","#ed8936"]
+                        for i, k in enumerate(top_keys_raw):
+                            label = ALLOC_COLS.get(k, k)
+                            ser = pd.to_numeric(df[k], errors="coerce")
+                            fig_ts.add_trace(go.Scatter(
+                                x=df["date"], y=ser,
+                                mode="lines", name=label,
+                                line=dict(color=COLORS[i % len(COLORS)], width=1.8),
+                            ))
+                        fig_ts.update_layout(
+                            height=260, paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                            xaxis=dict(gridcolor="#1a1f2e"),
+                            yaxis=dict(gridcolor="#1a1f2e", ticksuffix="%"),
+                            legend=dict(bgcolor="rgba(26,31,46,0.9)",
+                                        bordercolor="#2d3748", borderwidth=1,
+                                        font=dict(size=10)),
+                            font=dict(color="#8892a4", size=11),
+                            margin=dict(l=0,r=0,t=10,b=0), hovermode="x unified",
+                        )
+                        st.plotly_chart(fig_ts, use_container_width=True)
+                else:
+                    st.info("Bu fon için portföy dağılım verisi bulunamadı.")
 
     # Footer
     st.markdown("""
