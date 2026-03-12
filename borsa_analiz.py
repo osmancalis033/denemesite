@@ -2,7 +2,7 @@
 BIST & ABD Hisse Analiz Paneli
 Gereksinimler: pip install streamlit yfinance plotly pandas numpy requests
 Çalıştırma  : streamlit run borsa_analiz.py
-"""
+""" 
 
 import streamlit as st
 import yfinance as yf
